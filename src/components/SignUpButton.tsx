@@ -1,4 +1,20 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { HubConnection } from "@microsoft/signalr";
+import {
+  HubConnectionBuilder,
+  HubConnectionState,
+  LogLevel,
+} from "@microsoft/signalr";
+
+const API_BASE_URL = "http://localhost:8081";
+const AUTH_HUB_URL = `${API_BASE_URL}/authHub`;
+const REGISTRATION_TIMEOUT_MS = 120_000;
+
+type RegistrationConfirmedDto = {
+  registrationId: string;
+  userName: string;
+  token: string;
+};
 
 function getResponseCode(payload: unknown): string {
   if (typeof payload === "string") {
@@ -25,29 +41,80 @@ function getResponseCode(payload: unknown): string {
   return JSON.stringify(payload);
 }
 
+function saveRegistration(payload: RegistrationConfirmedDto) {
+  localStorage.setItem("authToken", payload.token);
+  localStorage.setItem("registrationId", payload.registrationId);
+  localStorage.setItem("authUserName", payload.userName);
+  window.dispatchEvent(new CustomEvent("auth:registered", { detail: payload }));
+}
+
 export function SignUpButton() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [telegramName, setTelegramName] = useState("");
+  const [authorizedUserName, setAuthorizedUserName] = useState(
+    () => localStorage.getItem("authUserName") ?? "",
+  );
   const [responseCode, setResponseCode] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isWaitingForConfirmation, setIsWaitingForConfirmation] = useState(false);
+  const connectionRef = useRef<HubConnection | null>(null);
+
+  useEffect(() => {
+    return () => {
+      void stopHubConnection();
+    };
+  }, []);
+
+  async function stopHubConnection() {
+    const connection = connectionRef.current;
+    connectionRef.current = null;
+
+    if (!connection) {
+      return;
+    }
+
+    connection.off("RegistrationConfirmed");
+    connection.off("Registration is already pending");
+
+    if (connection.state !== HubConnectionState.Disconnected) {
+      await connection.stop();
+    }
+  }
+
+  async function createRegistrationConnection(userName: string) {
+    await stopHubConnection();
+
+    const connection = new HubConnectionBuilder()
+      .withUrl(AUTH_HUB_URL)
+      .withAutomaticReconnect()
+      .configureLogging(LogLevel.Warning)
+      .build();
+
+    connectionRef.current = connection;
+
+    await connection.start();
+    await connection.invoke("JoinRegistration", userName);
+
+    return connection;
+  }
 
   async function handleRegister() {
     const trimmedName = telegramName.trim();
 
     if (!trimmedName) {
       setErrorMessage("Введите ник в Telegram.");
-      setResponseCode("");
       return;
     }
 
     setIsSubmitting(true);
+    setIsWaitingForConfirmation(false);
     setErrorMessage("");
     setResponseCode("");
 
     try {
       const response = await fetch(
-        `http://localhost:8081/Auth/Register?userName=${encodeURIComponent(trimmedName)}`,
+        `${API_BASE_URL}/Auth/Register?userName=${encodeURIComponent(trimmedName)}`,
       );
 
       if (!response.ok) {
@@ -55,29 +122,69 @@ export function SignUpButton() {
       }
 
       const contentType = response.headers.get("content-type") ?? "";
-      const payload = contentType.includes("application/json")
+      const apiPayload = contentType.includes("application/json")
         ? await response.json()
         : await response.text();
 
-      setResponseCode(getResponseCode(payload));
+      setResponseCode(getResponseCode(apiPayload));
+      setIsWaitingForConfirmation(true);
+
+      const connection = await createRegistrationConnection(trimmedName);
+      const registrationConfirmed = new Promise<RegistrationConfirmedDto>(
+        (resolve, reject) => {
+          const timeoutId = window.setTimeout(() => {
+            reject(new Error("Истекло время ожидания подтверждения регистрации."));
+          }, REGISTRATION_TIMEOUT_MS);
+
+          connection.on(
+            "RegistrationConfirmed",
+            (payload: RegistrationConfirmedDto) => {
+              window.clearTimeout(timeoutId);
+              resolve(payload);
+            },
+          );
+
+          connection.on("Registration is already pending", () => {
+            window.clearTimeout(timeoutId);
+            reject(new Error("Регистрация для этого пользователя уже ожидает подтверждения."));
+          });
+        },
+      );
+
+      const payload = await registrationConfirmed;
+      saveRegistration(payload);
+      setAuthorizedUserName(payload.userName);
+      setIsModalOpen(false);
+      setTelegramName("");
+      setResponseCode("");
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Не удалось выполнить запрос.";
       setErrorMessage(message);
     } finally {
       setIsSubmitting(false);
+      setIsWaitingForConfirmation(false);
+      await stopHubConnection();
     }
   }
 
   function handleOpenModal() {
+    if (authorizedUserName) {
+      return;
+    }
+
     setIsModalOpen(true);
     setTelegramName("");
     setResponseCode("");
     setErrorMessage("");
     setIsSubmitting(false);
+    setIsWaitingForConfirmation(false);
   }
 
   function handleCloseModal() {
+    void stopHubConnection();
+    setIsSubmitting(false);
+    setIsWaitingForConfirmation(false);
     setIsModalOpen(false);
   }
 
@@ -88,7 +195,7 @@ export function SignUpButton() {
         onClick={handleOpenModal}
         className="fixed top-6 right-6 px-6 py-2 bg-[#005254] text-white rounded-lg font-semibold hover:bg-[#003536] transition-colors z-50"
       >
-        Sign Up
+        {authorizedUserName ? `@${authorizedUserName.replace(/^@/, "")}` : "Sign Up"}
       </button>
 
       {isModalOpen ? (
@@ -119,6 +226,7 @@ export function SignUpButton() {
               <input
                 type="text"
                 value={telegramName}
+                disabled={isSubmitting}
                 onChange={(event) => setTelegramName(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !isSubmitting) {
@@ -126,7 +234,7 @@ export function SignUpButton() {
                   }
                 }}
                 placeholder="@username"
-                className="w-full rounded-xl border border-[#b7c7c8] px-4 py-3 outline-none transition focus:border-[#005254] focus:ring-2 focus:ring-[#005254]/20"
+                className="w-full rounded-xl border border-[#b7c7c8] px-4 py-3 outline-none transition focus:border-[#005254] focus:ring-2 focus:ring-[#005254]/20 disabled:bg-[#eef3f3] disabled:text-[#6a8f90]"
               />
             </label>
 
@@ -136,7 +244,11 @@ export function SignUpButton() {
               disabled={isSubmitting}
               className="mt-5 w-full rounded-xl bg-[#005254] px-4 py-3 font-semibold text-white transition hover:bg-[#003536] disabled:cursor-not-allowed disabled:bg-[#6a8f90]"
             >
-              {isSubmitting ? "Отправка..." : "Далее"}
+              {isWaitingForConfirmation
+                ? "Ожидание подтверждения..."
+                : isSubmitting
+                  ? "Отправка..."
+                  : "Далее"}
             </button>
 
             {errorMessage ? (
@@ -152,6 +264,12 @@ export function SignUpButton() {
                   {responseCode}
                 </p>
               </div>
+            ) : null}
+
+            {isWaitingForConfirmation ? (
+              <p className="mt-4 rounded-xl bg-[#eef6f6] px-4 py-3 text-sm text-[#456567]">
+                Подтвердите регистрацию в Telegram. Окно закроется автоматически.
+              </p>
             ) : null}
           </div>
         </div>
